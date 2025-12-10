@@ -1,7 +1,5 @@
-##### 핵심 전처리 코드ㅡ
-## 이미지 로드 → 얼굴 정렬 → 인종 필터링 → 파싱 → 3채널 조건지도(주름/모공/홍조) 생성
-
 import os
+import sys
 import cv2
 import numpy as np
 import torch
@@ -9,211 +7,173 @@ import torchvision.transforms as transforms
 from insightface.app import FaceAnalysis
 from PIL import Image
 
+# Utils 경로 추가
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.join(current_dir, 'utils'))
+
+# Feature Extract 함수 임포트
+try:
+    from feature_extract import get_wrinkle_map, get_pore_map, get_redness_map
+except ImportError as e:
+    print(f"Error: Could not import feature_extract.py. {e}")
+    exit(1)
+
+from utils.bisenet import BiSeNet
+
 # --- [설정] ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-RAW_DATA_PATH = "./data/raw"
-SAVE_PATH = "./data/processed"
-WEIGHTS_PATH = "./weights"
-
-# --- [1. 알고리즘: 미세 요소 추출 (논문 3.3)] ---
-
-def get_wrinkle_map(img_gray, mask):
-    """
-    논문 3.3.1 주름 검출: Laplacian + Gabor Filter Bank
-    Formula: Norm(0.6 * |Laplacian| + 0.4 * Gabor)
-    """
-    # 1. Laplacian (2차 미분)
-    laplacian = cv2.Laplacian(img_gray, cv2.CV_64F, ksize=3)
-    laplacian = np.abs(laplacian)
-
-    # 2. Gabor Filter Bank (0, 45, 90, 135도)
-    gabor_response = np.zeros_like(img_gray, dtype=np.float64)
-    ksize = 31 # 커널 크기
-    for theta in [0, 45, 90, 135]:
-        theta_rad = np.deg2rad(theta)
-        # cv2.getGaborKernel(ksize, sigma, theta, lambda, gamma, psi)
-        kernel = cv2.getGaborKernel((ksize, ksize), 4.0, theta_rad, 10.0, 0.5, 0, ktype=cv2.CV_64F)
-        filtered = cv2.filter2D(img_gray, cv2.CV_64F, kernel)
-        gabor_response += np.abs(filtered)
-
-    gabor_response /= 4.0 # 평균
-
-    # 3. Fusion & Normalize
-    # 가중치: 논문 실험값 (alpha=0.6)
-    wrinkle_map = 0.6 * laplacian + 0.4 * gabor_response
-
-    # ROI Masking & Normalization
-    wrinkle_map = wrinkle_map * mask
-
-    # Robust Normalization (Percentile 5~95%)
-    vmin, vmax = np.percentile(wrinkle_map[mask > 0], [5, 95])
-    wrinkle_map = np.clip((wrinkle_map - vmin) / (vmax - vmin + 1e-6), 0, 1)
-
-    return wrinkle_map.astype(np.float32)
-
-def get_pore_map(img_gray, mask):
-    """
-    논문 3.3.2 모공 검출: DoG (Difference of Gaussians)
-    Formula: Norm(G_sigma1 - G_sigma2)
-    """
-    #
-    sigma_small = 0.9
-    sigma_large = 2.2
-
-    g1 = cv2.GaussianBlur(img_gray, (0, 0), sigma_small)
-    g2 = cv2.GaussianBlur(img_gray, (0, 0), sigma_large)
-
-    dog = g1 - g2
-
-    # 모공은 어두운 점이므로 음수 값을 반전 (함몰 부위 탐지)
-    # 하지만 DoG 특성상 엣지가 강조되므로 절대값 사용 혹은 양수 클리핑
-    # 여기서는 텍스처 강도를 위해 절대값 사용
-    pore_map = np.abs(dog) * mask
-
-    # Normalization (Percentile 3~97%)
-    if np.sum(mask) > 0:
-        vmin, vmax = np.percentile(pore_map[mask > 0], [3, 97])
-        pore_map = np.clip((pore_map - vmin) / (vmax - vmin + 1e-6), 0, 1)
-
-    return pore_map.astype(np.float32)
-
-def get_redness_map(img_bgr, mask):
-    """
-    논문 3.3.3 홍조 검출: LAB Color Space + Guided Filter
-    Target: a* channel (Green-Red axis)
-    """
-    # 1. BGR to LAB 변환
-    img_lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    l_channel, a_channel, b_channel = cv2.split(img_lab)
-
-    # 2. Extract a* channel (Redness)
-    # OpenCV LAB range: L(0-255), a(0-255), b(0-255).
-    # a channel: 128 is neutral. >128 is Red, <128 is Green.
-    a_float = a_channel.astype(np.float32)
-
-    # 양의 편향(Redness)만 고려: 128 이상인 값만 추출
-    redness_raw = np.maximum(0, a_float - 128.0)
-
-    # 3. Guided Filter
-    # 가이드 이미지로 L 채널(밝기) 사용 -> 엣지 보존 스무딩
-    radius = 15
-    eps = 0.001
-    # cv2.ximgproc가 없다면 일반 GaussianBlur로 대체 가능하나, Guided Filter 권장
-    try:
-        from cv2.ximgproc import guidedFilter
-        redness_map = guidedFilter(guide=l_channel, src=redness_raw, radius=radius, eps=eps)
-    except ImportError:
-        print("Warning: opencv-contrib-python not found. Using GaussianBlur instead.")
-        redness_map = cv2.GaussianBlur(redness_raw, (0, 0), 3)
-
-    redness_map = redness_map * mask
-
-    # Normalization
-    if np.sum(mask) > 0:
-        vmin, vmax = np.percentile(redness_map[mask > 0], [5, 95])
-        redness_map = np.clip((redness_map - vmin) / (vmax - vmin + 1e-6), 0, 1)
-
-    return redness_map.astype(np.float32)
-
-# --- [2. 유틸리티: 모델 로드 및 파이프라인] ---
+PROJECT_ROOT = os.path.dirname(current_dir)
+RAW_DATA_PATH = os.path.join(PROJECT_ROOT, "data", "raw")
+SAVE_PATH = os.path.join(PROJECT_ROOT, "data", "processed")
+WEIGHTS_PATH = os.path.join(PROJECT_ROOT, "weights")
+IMG_SIZE = 1024 
+BISENET_INPUT_SIZE = 512
 
 class FacePreprocessor:
     def __init__(self):
-        # 1. InsightFace (Detection & Alignment)
-        # provider: RTX 5080 사용 시 'CUDAExecutionProvider'
-        self.app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        print(f"Initializing FacePreprocessor on {DEVICE}...")
+        
+        # 1. InsightFace
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if DEVICE == 'cuda' else ['CPUExecutionProvider']
+        self.app = FaceAnalysis(name='buffalo_l', providers=providers)
         self.app.prepare(ctx_id=0, det_size=(640, 640))
 
-        # 2. BiSeNet (Parsing)
-        # 모델 정의가 복잡하므로 여기서는 간소화된 로딩 로직 사용 (실제론 utils/bisenet.py 필요)
-        # 사용자는 사전 학습된 79999_iter.pth가 필요함
+        # 2. BiSeNet 로드
         self.parsing_net = self._load_bisenet()
+        
+        # [수정됨] BiSeNet용 정규화 (ImageNet 표준 사용 - 이전 코드와 동일하게 맞춤)
         self.to_tensor = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
 
     def _load_bisenet(self):
-        # BiSeNet 모델 로드 (Placeholder)
-        # 실제 구현시에는 github의 model.py를 import 해야 함.
-        # 여기서는 로드되었다고 가정.
-        print(f"Loading BiSeNet from {os.path.join(WEIGHTS_PATH, '79999_iter.pth')}...")
-        # net = BiSeNet(n_classes=19)
-        # net.load_state_dict(torch.load(path))
-        # return net.to(DEVICE).eval()
-        return None # (실제 코드 실행을 위해선 이 부분을 구현해야 함)
+        weight_path = os.path.join(WEIGHTS_PATH, '79999_iter.pth')
+        if not os.path.exists(weight_path):
+            print(f"Error: BiSeNet weights not found at {weight_path}")
+            exit(1)
+        net = BiSeNet(n_classes=19)
+        net.load_state_dict(torch.load(weight_path, map_location=DEVICE))
+        net.to(DEVICE).eval()
+        return net
+
+    def run_parsing(self, img):
+        # 1. Resize
+        img_resized = cv2.resize(img, (BISENET_INPUT_SIZE, BISENET_INPUT_SIZE))
+        
+        # 2. To Tensor (ImageNet Normalize 적용됨)
+        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+        img_tensor = self.to_tensor(Image.fromarray(img_rgb)).unsqueeze(0).to(DEVICE)
+        
+        # 3. Inference
+        with torch.no_grad():
+            out = self.parsing_net(img_tensor)[0]
+        
+        # 4. Argmax
+        parsing_map = out.squeeze(0).cpu().numpy().argmax(0)
+        
+        # 5. Mask Definition (Skin=1, Nose=10)
+        # 79999_iter.pth 기준: 
+        # 0:bg, 1:skin, 2:l_brow, 3:r_brow, 4:l_eye, 5:r_eye, 6:eye_g, 7:l_ear, 8:r_ear, 
+        # 9:ear_r, 10:nose, 11:mouth, 12:u_lip, 13:l_lip, 14:neck, 15:neck_l, 16:cloth, 17:hair, 18:hat
+        
+        # 확실한 피부 영역(1)과 코(10)만 선택. (입술, 눈 등 배제)
+        skin_mask_small = np.where((parsing_map == 1) | (parsing_map == 10), 1, 0).astype(np.float32)
+        
+        # 6. Resize back to 1024
+        skin_mask = cv2.resize(skin_mask_small, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+        
+        # [디버깅용] 파싱 결과 컬러맵 저장 (이게 이상하면 정규화 문제임)
+        # debug_viz = (parsing_map * (255/19)).astype(np.uint8)
+        # debug_viz = cv2.applyColorMap(debug_viz, cv2.COLORMAP_JET)
+        # return skin_mask, debug_viz # 디버깅 필요시 주석 해제
+        
+        return skin_mask
 
     def process_single_image(self, img_path):
         filename = os.path.basename(img_path)
-        img = cv2.imread(img_path)
-        if img is None: return
+        try:
+            img = cv2.imread(img_path)
+            if img is None: return
+        except: return
 
-        # 1. Face Detection & Alignment
+        # 1. Face Detection
         faces = self.app.get(img)
         if len(faces) == 0:
-            print(f"No face detected: {filename}")
+            print(f"Skipping {filename}: No face detected.")
             return
 
-        # 가장 큰 얼굴 선택
         face = sorted(faces, key=lambda x: x.bbox[2]*x.bbox[3])[-1]
 
-        # [논문 3.2] 인종 분류 (FairFace Logic Placeholder)
-        # 실제 FairFace 모델 추론 코드가 필요함. 여기서는 InsightFace gender로 예시 대체
-        # if not self.is_east_asian(face_img): return
-
-        # InsightFace Alignment (1024x1024로 리사이즈 필요할 수 있음)
-        # 여기서는 crop 후 resize
+        # Crop & Resize
         bbox = face.bbox.astype(int)
-        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        center = ((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2)
-        size = int(max(w, h) * 1.5) # 여유 있게 크롭
+        x1, y1, x2, y2 = bbox[0], bbox[1], bbox[2], bbox[3]
+        x1 = max(0, x1); y1 = max(0, y1)
+        x2 = min(img.shape[1], x2); y2 = min(img.shape[0], y2)
+        
+        w, h = x2 - x1, y2 - y1
+        if w <= 0 or h <= 0: return
 
-        face_img = cv2.getRectSubPix(img, (size, size), center)
-        face_img = cv2.resize(face_img, (1024, 1024)) # 논문 해상도
+        center_x, center_y = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        size = int(max(w, h) * 1.5)
+        
+        face_img = cv2.getRectSubPix(img, (size, size), (center_x, center_y))
+        if face_img is None or face_img.size == 0: return
+        face_img = cv2.resize(face_img, (IMG_SIZE, IMG_SIZE))
 
-        # 2. Face Parsing (Get Skin Mask)
-        # (실제 모델 추론 코드로 대체 필요)
-        # mask = self.run_parsing(face_img)
-        # 여기서는 테스트를 위해 임시로 중앙을 피부로 가정
-        mask = np.zeros((1024, 1024), dtype=np.float32)
-        cv2.circle(mask, (512, 512), 400, 1, -1)
+        # 2. Face Parsing
+        mask = self.run_parsing(face_img)
+        
+        if np.sum(mask) < (IMG_SIZE * IMG_SIZE * 0.05):
+            print(f"Skipping {filename}: Invalid mask size.")
+            return
 
-        # 3. Feature Extraction [논문 3.3]
+        # 3. Feature Extraction
         img_gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-
+        
         wrinkle = get_wrinkle_map(img_gray, mask)
         pore = get_pore_map(img_gray, mask)
         redness = get_redness_map(face_img, mask)
 
-        # 4. Save Results
+        # 4. Save
         base_name = os.path.splitext(filename)[0]
         os.makedirs(os.path.join(SAVE_PATH, 'images'), exist_ok=True)
         os.makedirs(os.path.join(SAVE_PATH, 'maps'), exist_ok=True)
 
         cv2.imwrite(os.path.join(SAVE_PATH, 'images', filename), face_img)
 
-        # 조건지도는 NPY로 저장 (학습용) 및 시각화용 PNG 저장
-        maps_stack = np.stack([redness, wrinkle, pore], axis=0) # [3, H, W]
+        # Save NPY (4 channels)
+        maps_stack = np.stack([redness, wrinkle, pore, mask], axis=0)
         np.save(os.path.join(SAVE_PATH, 'maps', f"{base_name}_cond.npy"), maps_stack)
 
-        # 시각화 저장 (R, G, B 채널에 매핑)
+        # [수정됨] 디버깅을 위한 마스크 시각화 강화
+        # 마스크 영역(흰색) + 원본 이미지 오버레이
+        mask_viz = (mask * 255).astype(np.uint8)
+        mask_viz = cv2.cvtColor(mask_viz, cv2.COLOR_GRAY2BGR)
+        
+        # 텍스처 맵 시각화
         vis_img = cv2.merge([
-            (pore * 255).astype(np.uint8),    # B: Pore
-            (wrinkle * 255).astype(np.uint8), # G: Wrinkle
-            (redness * 255).astype(np.uint8)  # R: Redness
+            (pore * 255).astype(np.uint8),
+            (wrinkle * 255).astype(np.uint8),
+            (redness * 255).astype(np.uint8)
         ])
-        cv2.imwrite(os.path.join(SAVE_PATH, 'maps', f"{base_name}_vis.png"), vis_img)
+        
+        # 마스크와 맵을 나란히 저장 (왼쪽: 마스크 확인용, 오른쪽: 텍스처 확인용)
+        debug_concat = np.hstack([mask_viz, vis_img])
+        
+        cv2.imwrite(os.path.join(SAVE_PATH, 'maps', f"{base_name}_vis.png"), debug_concat)
+        
         print(f"Processed: {filename}")
 
 if __name__ == "__main__":
-    processor = FacePreprocessor()
-
-    # data/raw 폴더의 모든 이미지 처리
     if not os.path.exists(RAW_DATA_PATH):
         os.makedirs(RAW_DATA_PATH)
-        print(f"Please put test images in {RAW_DATA_PATH}")
-    else:
-        files = os.listdir(RAW_DATA_PATH)
-        for f in files:
-            if f.lower().endswith(('.png', '.jpg', '.jpeg')):
-                processor.process_single_image(os.path.join(RAW_DATA_PATH, f))
+        print(f"Created {RAW_DATA_PATH}. Please put raw images here.")
+        exit()
+        
+    processor = FacePreprocessor()
+    files = [f for f in os.listdir(RAW_DATA_PATH) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    print(f"Found {len(files)} images.")
+    
+    for f in files:
+        processor.process_single_image(os.path.join(RAW_DATA_PATH, f))

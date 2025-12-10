@@ -1,1 +1,4 @@
-src/data/
+data/
+weights/
+src/__pycache__
+src/utils/__pycache__

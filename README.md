@@ -7,7 +7,7 @@
 ```bash
 conda create -n face_deaging python=3.10 -y
 conda activate face_deaging
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 (설치 후 확인: python -c "import torch; print(torch.cuda.is_available())")
 pip install numpy pandas matplotlib scipy tqdm pyyaml
 pip install opencv-python scikit-image pillow
@@ -73,21 +73,18 @@ python evaluate.py --checkpoint ./data/checkpoints/my_first_run/netG_epoch_100.p
 ```bash
 HighRes-Face-DeAging-SPADE/
 │
-├── requirements.txt       # [Phase 1] 필수 라이브러리 목록
-│
-├── weights/               # [사전 준비] 다운로드 받은 Pretrained 모델들
-│   ├── 79999_iter.pth                    # BiSeNet (Face Parsing)
-│   ├── res34_fair_align_multi_7_20190809.pt # FairFace (Race Filter)
-│   └── model_ir_se50.pth                 # ArcFace (Identity Loss)
-│
-├── data/                  # [Phase 2] 데이터 저장소
-│   ├── raw/               # (Input) 원본 이미지 (AI-Hub, FFHQ 등)
-│   ├── processed/         # (Output) 전처리 완료된 데이터
-│   │   ├── images/        # 정렬된 얼굴 이미지
-│   │   └── maps/          # 3채널 조건지도 (.npy)
-│   └── checkpoints/       # (Train Output) 학습된 모델 가중치 (.pth) 및 로그
-│
-└── src/                   # [Main Code] 작성한 모든 소스 코드
+└── src/
+    ├── data/                  # [Phase 2] 데이터 저장소
+    │   ├── raw/               # (Input) 원본 이미지 (AI-Hub, FFHQ 등)
+    │   ├── processed/         # (Output) 전처리 완료된 데이터
+    │   │   ├── images/        # 정렬된 얼굴 이미지
+    │   │   └── maps/          # 3채널 조건지도 (.npy)
+    │   │── checkpoints/       # (Train Output) 학습된 모델 가중치 (.pth) 및 로그                   
+    ├── weights/               # [사전 준비] 다운로드 받은 Pretrained 모델들
+        ├── 79999_iter.pth                    # BiSeNet (Face Parsing)
+        ├── res34_fair_align_multi_7_20190809.pt # FairFace (Race Filter)
+        └── model_ir_se50.pth                 # ArcFace (Identity Loss)
+      # [Main Code] 작성한 모든 소스 코드
     ├── preprocess.py      # [Phase 2] 전처리 및 조건지도 생성 스크립트
     ├── networks.py        # [Phase 3] SPADE 생성기 및 판별기 아키텍처
     ├── losses.py          # [Phase 3] Cycle, Identity, VGG 손실 함수
@@ -95,5 +92,6 @@ HighRes-Face-DeAging-SPADE/
     ├── train.py           # [Phase 4] 모델 학습 실행 스크립트
     ├── test.py            # [Phase 5] 추론 및 결과 이미지 생성 (시각화)
     ├── evaluate.py        # [Phase 5] 정량적 평가 (Attr-MAE 계산)
-    └── test_arch.py       # [Phase 5] 네트워크 구조 테스트
+    ├── test_arch.py       # [Phase 5] 네트워크 구조 테스트
+    └── requirements.txt       # [Phase 1] 필수 라이브러리 목록
 ```
