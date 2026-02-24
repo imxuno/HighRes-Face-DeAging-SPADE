@@ -24,6 +24,7 @@ pip install -r requirements.txt
    다운로드: [dchen236/FairFace GitHub](https://github.com/dchen236/FairFace)
 3. ArcFace
    다운로드: [Trezor/InsightFace_Pytorch GitHub](https://github.com/TreB1eN/InsightFace_Pytorch)
+4. 다운로드 받은 모델들을 루트 폴더 아래 weights 폴더 생성 후 넣어두기
 
 ### 실행 가이드
 
