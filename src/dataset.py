@@ -13,17 +13,34 @@ cv2.ocl.setUseOpenCL(False)
 
 class FaceDataset(Dataset):
     def __init__(self, root_dir, is_train=True, image_size=512):
+        """
+        root_dir/
+          ├─ images/
+          │    └─ xxx.png / xxx.jpg ...
+          └─ maps/
+               └─ xxx_cond.npy  # (4, H, W) = [Redness, Wrinkle, Pore, Mask]
+        """
         self.root_dir = root_dir
         self.img_dir = os.path.join(root_dir, "images")
         self.map_dir = os.path.join(root_dir, "maps")
         self.image_size = image_size
+        self.is_train = is_train
 
-        # 이미지 파일 목록 로드
-        self.image_names = [
+        # --- 디렉터리 존재 여부 확인 ---
+        if not os.path.isdir(self.img_dir):
+            raise FileNotFoundError(f"[FaceDataset] Image dir not found: {self.img_dir}")
+        if not os.path.isdir(self.map_dir):
+            print(f"[FaceDataset Warning] Map dir not found: {self.map_dir}")
+            print("  → 모든 샘플에 대해 dummy mask(=1.0)가 사용됩니다.")
+
+        # --- 이미지 파일 목록 로드 (정렬해서 재현성 확보) ---
+        self.image_names = sorted(
             f for f in os.listdir(self.img_dir)
             if f.lower().endswith((".png", ".jpg", ".jpeg"))
-        ]
-        self.is_train = is_train
+        )
+
+        if len(self.image_names) == 0:
+            raise RuntimeError(f"[FaceDataset] No images found in: {self.img_dir}")
 
         # 정규화: [-1, 1] 범위로 변환
         self.transform = transforms.Compose(
@@ -40,7 +57,9 @@ class FaceDataset(Dataset):
         img_name = self.image_names[idx]
         base_name = os.path.splitext(img_name)[0]
 
+        # ------------------------------------------------------------------
         # 1. 이미지 로드 (Load Image)
+        # ------------------------------------------------------------------
         img_path = os.path.join(self.img_dir, img_name)
         try:
             img = cv2.imread(img_path)
@@ -48,11 +67,13 @@ class FaceDataset(Dataset):
                 raise FileNotFoundError(f"Image not found: {img_path}")
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         except Exception as e:
-            # 에러 발생 시 None 반환 -> train.py에서 건너뜀 (학습 중단 방지)
+            # 에러 발생 시 None 반환 -> train.py에서 safe_collate가 건너뜀
             print(f"[Image Error] {img_name}: {e}")
             return None
 
-        # 2. 맵 로드 (Load Maps) - Cond 3ch + Mask 1ch = 4ch
+        # ------------------------------------------------------------------
+        # 2. 맵 로드 (Load Condition Maps) - Cond 3ch + Mask 1ch = 4ch
+        # ------------------------------------------------------------------
         map_path = os.path.join(self.map_dir, f"{base_name}_cond.npy")
 
         if not os.path.exists(map_path):
@@ -63,7 +84,7 @@ class FaceDataset(Dataset):
             full_map[3, :, :] = 1.0  # 마스크 채널은 1로 설정
         else:
             try:
-                full_map = np.load(map_path)
+                full_map = np.load(map_path, allow_pickle=False)
                 full_map = np.asarray(full_map, dtype=np.float32)
 
                 # 기대 형태: (C, H, W)
@@ -78,7 +99,9 @@ class FaceDataset(Dataset):
                 print(f"[Map Load Error] {base_name}: {e}")
                 return None
 
+        # ------------------------------------------------------------------
         # 3. 리사이즈 (Resize)
+        # ------------------------------------------------------------------
         try:
             # 이미지 리사이즈
             if (
@@ -92,7 +115,9 @@ class FaceDataset(Dataset):
                 )
 
             # 맵 리사이즈: 채널별로 직접 리사이즈해서 transpose 문제 회피
-            C, Hm, Wm = full_map.shape  # C=4 기대
+            full_map = full_map.astype(np.float32, copy=False)
+            C, Hm, Wm = full_map.shape  # C >= 4 기대
+
             if Hm != self.image_size or Wm != self.image_size:
                 resized_map = np.zeros(
                     (C, self.image_size, self.image_size),
@@ -110,7 +135,9 @@ class FaceDataset(Dataset):
             print(f"[Resize Error] {base_name}: {e}")
             return None
 
+        # ------------------------------------------------------------------
         # 4. 채널 분리 (Split Condition Maps and Mask)
+        # ------------------------------------------------------------------
         # 전처리 단계에서 [Redness, Wrinkle, Pore, Mask] 순서로 저장됨이라고 가정
         if full_map.shape[0] < 4:
             print(
@@ -118,23 +145,34 @@ class FaceDataset(Dataset):
                 f"expected >=4 channels, got {full_map.shape[0]}. Skipping."
             )
             return None
+        elif full_map.shape[0] > 4:
+            # 필요 이상으로 채널이 많을 경우 앞의 4개만 사용
+            print(
+                f"[Map Channel Info] {base_name}: "
+                f"{full_map.shape[0]} channels found, using first 4."
+            )
+            full_map = full_map[:4, :, :]
 
         cond_map = full_map[:3, :, :]  # (3, H, W) -> SPADE 입력용 조건 지도
         mask = full_map[3:4, :, :]     # (1, H, W) -> Loss 마스킹용 (채널 차원 유지)
 
+        # ------------------------------------------------------------------
         # 5. SPADE 입력 데이터 생성 (Condition + Mask)
+        # ------------------------------------------------------------------
         spade_input = np.concatenate([cond_map, mask], axis=0)  # (4, H, W)
 
+        # ------------------------------------------------------------------
         # 6. 텐서 변환 (To Tensor)
-        img_tensor = self.transform(img)                # (3, H, W), [-1,1]
+        # ------------------------------------------------------------------
+        img_tensor = self.transform(img)                      # (3, H, W), [-1,1]
         spade_tensor = torch.from_numpy(spade_input).float()
         target_maps_tensor = torch.from_numpy(cond_map).float()
         mask_tensor = torch.from_numpy(mask).float()
 
         return {
-            "image": img_tensor,          # Real Image ([-1, 1])
-            "spade_input": spade_tensor,  # Generator 입력 (Red, Wrinkle, Pore, Mask)
+            "image": img_tensor,           # Real Image ([-1, 1])
+            "spade_input": spade_tensor,   # Generator 입력 (Red, Wrinkle, Pore, Mask)
             "target_maps": target_maps_tensor,  # Cycle Loss 정답지 (Red, Wrinkle, Pore)
-            "mask": mask_tensor,          # Loss 마스크 (Mask)
+            "mask": mask_tensor,           # Loss 마스크 (Mask)
             "name": base_name,
         }

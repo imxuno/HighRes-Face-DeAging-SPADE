@@ -57,8 +57,16 @@ class IdentityLoss(nn.Module):
         real = (img_real + 1.0) / 2.0
         fake = (img_fake + 1.0) / 2.0
 
-        real_resize = F.interpolate(real, size=(112, 112), mode="bilinear", align_corners=False)
-        fake_resize = F.interpolate(fake, size=(112, 112), mode="bilinear", align_corners=False)
+        # AMP 환경에서도 이 Loss는 float32로 고정해서 안정성 확보
+        real = real.float()
+        fake = fake.float()
+
+        real_resize = F.interpolate(
+            real, size=(112, 112), mode="bilinear", align_corners=False
+        )
+        fake_resize = F.interpolate(
+            fake, size=(112, 112), mode="bilinear", align_corners=False
+        )
 
         with torch.no_grad():
             emb_real = self.net(real_resize)
@@ -103,8 +111,8 @@ class CycleConsistencyLoss(nn.Module):
                     )
                     kernels.append(torch.from_numpy(kernel))
 
-        # (N,1,K,K) 형태
-        return torch.stack(kernels).unsqueeze(1)  # float32
+        # (N,1,K,K) 형태, float32
+        return torch.stack(kernels).unsqueeze(1)
 
     def normalize_minmax(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -154,8 +162,17 @@ class CycleConsistencyLoss(nn.Module):
         target_maps: torch.Tensor,    # (B,3,H,W), [0,1]
         mask: torch.Tensor,           # (B,1,H,W), 0/1
     ) -> torch.Tensor:
+        """
+        AMP/autocast 환경에서도 안정성을 높이기 위해
+        이 Loss 내부는 float32로 강제해서 계산.
+        """
         # [-1,1] -> [0,1]
         img_gen_norm = (img_gen + 1.0) / 2.0
+
+        # 모두 float32로 캐스팅 (gabor, kornia 연산 안전성↑)
+        img_gen_norm = img_gen_norm.float()
+        target_maps = target_maps.float()
+        mask = mask.float()
 
         # Grayscale for wrinkle/pore
         img_gray = kc.rgb_to_grayscale(img_gen_norm)
@@ -190,8 +207,12 @@ class VGGLoss(nn.Module):
         try:
             weights = models.VGG19_Weights.IMAGENET1K_V1
             vgg = models.vgg19(weights=weights).features
-            self.register_buffer("mean", torch.tensor(weights.meta["mean"]).view(1, 3, 1, 1))
-            self.register_buffer("std", torch.tensor(weights.meta["std"]).view(1, 3, 1, 1))
+            self.register_buffer(
+                "mean", torch.tensor(weights.meta["mean"]).view(1, 3, 1, 1)
+            )
+            self.register_buffer(
+                "std", torch.tensor(weights.meta["std"]).view(1, 3, 1, 1)
+            )
         except Exception:
             # 구버전 torchvision 호환
             vgg = models.vgg19(pretrained=True).features
@@ -220,7 +241,11 @@ class VGGLoss(nn.Module):
         [-1,1] 범위의 이미지를 [0,1]로 변환 후 ImageNet mean/std 정규화.
         """
         x = (x + 1.0) / 2.0
-        return (x - self.mean.to(x.device)) / self.std.to(x.device)
+        # AMP 상황에서도 VGG는 float32로 고정하는 편이 안전
+        x = x.float()
+        mean = self.mean.to(x.device, dtype=x.dtype)
+        std = self.std.to(x.device, dtype=x.dtype)
+        return (x - mean) / std
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         x = self._preprocess(x)
