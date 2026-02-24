@@ -1,92 +1,106 @@
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.models as models
 import kornia.filters as kf
 import kornia.color as kc
 from torch.nn import functional as F
-import cv2
-import numpy as np
 
 
-# --- [1] Identity Loss (ArcFace-like embedding) ---
+# ============================================================
+# [1] Identity Loss (ResNet50 embedding, "ArcFace-like")
+# ============================================================
 class IdentityLoss(nn.Module):
     """
-    얼굴 임베딩 간 코사인 거리로 ID 보존을 강제하는 Loss.
-    현재는 torchvision resnet50 기반의 512-dim 임베딩을 사용한다.
-    (model_ir_se50.pth의 구조와 100% 일치하진 않을 수 있지만,
-     strict=False 로 가능한 부분만 로드해서 사용.)
+    ⚠️ 주의:
+    - model_ir_se50.pth는 원래 IR-SE50(ArcFace) 계열 가중치일 가능성이 큽니다.
+    - 여기서는 torchvision resnet50에 strict=False로 "맞는 것만" 로드하므로
+      '진짜 ArcFace' 수준의 성능을 보장하진 않습니다.
+    - 그래도 ID 보존 경향을 주는 regularizer로는 쓸 수 있습니다.
+
+    개선:
+    - ResNet 입력에 ImageNet mean/std 정규화를 적용 (매우 중요)
+    - AMP에서도 안정적으로 돌아가게 float32 강제
     """
 
     def __init__(self, pretrained_path: str, device: torch.device | str = "cuda"):
         super().__init__()
-        print(f"Loading ArcFace from {pretrained_path}")
+        print(f"Loading Identity backbone from {pretrained_path}")
+
         self.loss_fn = nn.CosineSimilarity(dim=1, eps=1e-6)
 
+        # ImageNet normalize (ResNet50에 필요)
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
         try:
-            self.net = self._load_arcface(pretrained_path, device)
+            self.net = self._load_backbone(pretrained_path, device)
         except Exception as e:
-            print(f"Error loading ArcFace: {e}")
+            print(f"[IdentityLoss] Error loading backbone: {e}")
             self.net = None
 
-    def _load_arcface(self, path: str, device: torch.device | str):
-        # 기본 backbone: torchvision resnet50
+    def _load_backbone(self, path: str, device: torch.device | str):
         net = models.resnet50(weights=None)
         net.fc = nn.Linear(2048, 512)
 
         try:
-            # CPU로 로드 후 원하는 device로 이동 (환경 호환성↑)
             state_dict = torch.load(path, map_location="cpu")
-            net.load_state_dict(state_dict, strict=False)
+            missing, unexpected = net.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"[IdentityLoss] missing keys: {len(missing)}")
+            if unexpected:
+                print(f"[IdentityLoss] unexpected keys: {len(unexpected)}")
         except Exception as e:
-            print(f"Warning: Failed to load ArcFace weights strictly. ({e})")
+            print(f"[IdentityLoss] Warning: failed to load weights strictly. ({e})")
 
         net = net.to(device).eval()
         for p in net.parameters():
             p.requires_grad = False
         return net
 
+    def _preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B,3,H,W) in [-1,1] -> [0,1] -> ImageNet normalize
+        """
+        x = (x + 1.0) / 2.0
+        x = x.float()
+        mean = self.mean.to(x.device, dtype=x.dtype)
+        std = self.std.to(x.device, dtype=x.dtype)
+        return (x - mean) / std
+
     def forward(self, img_real: torch.Tensor, img_fake: torch.Tensor) -> torch.Tensor:
-        """
-        img_real, img_fake: (B,3,H,W), [-1,1] 범위 가정
-        """
         if self.net is None:
-            # 학습 그래프에 안전하게 올라가도록 같은 device/type의 상수 사용
             return img_real.new_tensor(0.0)
 
-        # [-1,1] -> [0,1]
-        real = (img_real + 1.0) / 2.0
-        fake = (img_fake + 1.0) / 2.0
+        real = self._preprocess(img_real)
+        fake = self._preprocess(img_fake)
 
-        # AMP 환경에서도 이 Loss는 float32로 고정해서 안정성 확보
-        real = real.float()
-        fake = fake.float()
-
-        real_resize = F.interpolate(
-            real, size=(112, 112), mode="bilinear", align_corners=False
-        )
-        fake_resize = F.interpolate(
-            fake, size=(112, 112), mode="bilinear", align_corners=False
-        )
+        real_resize = F.interpolate(real, size=(112, 112), mode="bilinear", align_corners=False)
+        fake_resize = F.interpolate(fake, size=(112, 112), mode="bilinear", align_corners=False)
 
         with torch.no_grad():
             emb_real = self.net(real_resize)
         emb_fake = self.net(fake_resize)
 
-        # 1 - cos(·,·) => 0이면 동일, 2에 가까울수록 다른 얼굴
         return 1.0 - self.loss_fn(emb_real, emb_fake).mean()
 
 
-# --- [2] Cycle Consistency Loss (Wrinkle / Pore / Redness) ---
+# ============================================================
+# [2] Cycle Consistency Loss (Wrinkle / Pore / Redness)
+# ============================================================
 class CycleConsistencyLoss(nn.Module):
     """
-    생성된 이미지에서 주름 / 모공 / 홍조 맵을 추출해서,
-    주어진 target condition map과 L1로 맞추는 손실.
+    생성 이미지에서 [Redness, Wrinkle, Pore] 맵을 추출하여 target_maps와 L1로 맞춤.
+
+    개선:
+    - 정규화를 'mask 내부 기준 min/max'로 수행 (피부 밖 0값에 의해 min/max가 깨지는 문제 방지)
+    - 내부 연산은 float32 강제 (AMP에서도 안정)
     """
 
     def __init__(self):
         super().__init__()
-        kernels = self._create_gabor_kernels()
-        # 모델 이동 시 함께 device가 이동하도록 buffer로 등록
+        kernels = self._create_gabor_kernels()  # (N,1,K,K) float32
         self.register_buffer("gabor_kernels", kernels)
 
     def _create_gabor_kernels(self) -> torch.Tensor:
@@ -100,7 +114,7 @@ class CycleConsistencyLoss(nn.Module):
             theta = np.deg2rad(theta_deg)
             for lam in lambdas:
                 for sigma in sigmas:
-                    kernel = cv2.getGaborKernel(
+                    k = cv2.getGaborKernel(
                         (ksize, ksize),
                         sigma,
                         theta,
@@ -109,97 +123,105 @@ class CycleConsistencyLoss(nn.Module):
                         0,
                         ktype=cv2.CV_32F,
                     )
-                    kernels.append(torch.from_numpy(kernel))
+                    kernels.append(torch.from_numpy(k))
 
-        # (N,1,K,K) 형태, float32
-        return torch.stack(kernels).unsqueeze(1)
+        return torch.stack(kernels).unsqueeze(1).float()
 
-    def normalize_minmax(self, x: torch.Tensor) -> torch.Tensor:
+    def _masked_minmax(self, x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
         """
-        배치 내 각 이미지/채널별로 0~1 Min-Max 정규화
-        x: (B, C, H, W)
+        x: (B,C,H,W)
+        mask: (B,1,H,W) 0/1 (float)
+        -> mask 내부에서만 min/max를 구해 0~1 normalize
         """
         B, C, H, W = x.shape
-        x_flat = x.view(B, C, -1)
+        m = (mask > 0.5).float()
 
-        min_val = x_flat.min(dim=2, keepdim=True)[0].view(B, C, 1, 1)
-        max_val = x_flat.max(dim=2, keepdim=True)[0].view(B, C, 1, 1)
+        # (B,C,H,W)로 broadcast
+        m_bc = m.expand(B, C, H, W)
 
-        eps = 1e-6
-        return (x - min_val) / (max_val - min_val + eps)
+        # mask 밖은 min 계산에 +inf, max 계산에 -inf로 처리
+        x_min_src = torch.where(m_bc > 0.5, x, torch.full_like(x, float("inf")))
+        x_max_src = torch.where(m_bc > 0.5, x, torch.full_like(x, float("-inf")))
+
+        x_flat_min = x_min_src.view(B, C, -1)
+        x_flat_max = x_max_src.view(B, C, -1)
+
+        min_val = x_flat_min.min(dim=2, keepdim=True).values.view(B, C, 1, 1)
+        max_val = x_flat_max.max(dim=2, keepdim=True).values.view(B, C, 1, 1)
+
+        # mask가 너무 작아서 inf/-inf가 남는 케이스 방지
+        min_val = torch.where(torch.isfinite(min_val), min_val, torch.zeros_like(min_val))
+        max_val = torch.where(torch.isfinite(max_val), max_val, torch.ones_like(max_val))
+
+        denom = (max_val - min_val).clamp_min(eps)
+        out = (x - min_val) / denom
+        out = out.clamp(0.0, 1.0)
+
+        # mask 밖은 0
+        out = out * m_bc
+        return out
 
     def get_wrinkle_torch(self, img_gray: torch.Tensor) -> torch.Tensor:
-        # 1. Laplacian
-        laplacian = kf.laplacian(img_gray, kernel_size=3)
-        laplacian = torch.abs(laplacian)
-
-        # 2. Gabor
-        gabor_feat = F.conv2d(img_gray, self.gabor_kernels, padding=15)
-        gabor_response = torch.mean(torch.abs(gabor_feat), dim=1, keepdim=True)
-
-        # 3. Fusion
-        wrinkle_map = 0.6 * laplacian + 0.4 * gabor_response
-        return wrinkle_map
+        lap = kf.laplacian(img_gray, kernel_size=3).abs()
+        # gabor conv
+        kernels = self.gabor_kernels.to(img_gray.device, dtype=img_gray.dtype)
+        gabor_feat = F.conv2d(img_gray, kernels, padding=15)
+        gabor_response = gabor_feat.abs().mean(dim=1, keepdim=True)
+        return 0.6 * lap + 0.4 * gabor_response
 
     def get_pore_torch(self, img_gray: torch.Tensor) -> torch.Tensor:
         g1 = kf.gaussian_blur2d(img_gray, (5, 5), (1.0, 1.0))
         g2 = kf.gaussian_blur2d(img_gray, (9, 9), (2.5, 2.5))
-        dog = torch.abs(g1 - g2)
-        return dog
+        return (g1 - g2).abs()
 
-    def get_redness_torch(self, img_rgb: torch.Tensor) -> torch.Tensor:
-        # Kornia RGB to LAB (L:0~100, a:-128~127, b:-128~127)
-        img_lab = kc.rgb_to_lab(img_rgb)
+    def get_redness_torch(self, img_rgb01: torch.Tensor) -> torch.Tensor:
+        img_lab = kc.rgb_to_lab(img_rgb01)
         _, a, _ = torch.chunk(img_lab, 3, dim=1)
-
-        redness = F.relu(a)  # 양의 a만 사용
+        redness = F.relu(a)
         redness = kf.gaussian_blur2d(redness, (15, 15), (3.0, 3.0))
         return redness
 
     def forward(
         self,
-        img_gen: torch.Tensor,        # (B,3,H,W), [-1,1]
-        target_maps: torch.Tensor,    # (B,3,H,W), [0,1]
-        mask: torch.Tensor,           # (B,1,H,W), 0/1
+        img_gen: torch.Tensor,     # (B,3,H,W) [-1,1]
+        target_maps: torch.Tensor, # (B,3,H,W) [0,1]
+        mask: torch.Tensor,        # (B,1,H,W) 0/1
     ) -> torch.Tensor:
-        """
-        AMP/autocast 환경에서도 안정성을 높이기 위해
-        이 Loss 내부는 float32로 강제해서 계산.
-        """
-        # [-1,1] -> [0,1]
-        img_gen_norm = (img_gen + 1.0) / 2.0
-
-        # 모두 float32로 캐스팅 (gabor, kornia 연산 안전성↑)
-        img_gen_norm = img_gen_norm.float()
+        # float32 강제
+        img_gen = img_gen.float()
         target_maps = target_maps.float()
         mask = mask.float()
 
-        # Grayscale for wrinkle/pore
-        img_gray = kc.rgb_to_grayscale(img_gen_norm)
+        # [-1,1] -> [0,1]
+        img01 = (img_gen + 1.0) / 2.0
 
-        # Raw feature extraction
+        img_gray = kc.rgb_to_grayscale(img01)
+
         raw_wrinkle = self.get_wrinkle_torch(img_gray)
         raw_pore = self.get_pore_torch(img_gray)
-        raw_redness = self.get_redness_torch(img_gen_norm)
+        raw_redness = self.get_redness_torch(img01)
 
-        # 예측값을 0~1로 정규화해서 target range에 맞춤
-        pred_wrinkle = self.normalize_minmax(raw_wrinkle)
-        pred_pore = self.normalize_minmax(raw_pore)
-        pred_redness = self.normalize_minmax(raw_redness)
+        # mask 내부 기준 normalize
+        pred_wrinkle = self._masked_minmax(raw_wrinkle, mask)
+        pred_pore = self._masked_minmax(raw_pore, mask)
+        pred_redness = self._masked_minmax(raw_redness, mask)
 
-        # 채널 순서: [Redness, Wrinkle, Pore]
         pred_stack = torch.cat([pred_redness, pred_wrinkle, pred_pore], dim=1)
 
-        # L1 Loss with Mask
+        # mask는 (B,1,H,W)라 채널 broadcast로 작동
         loss = F.l1_loss(pred_stack * mask, target_maps[:, :3] * mask)
         return loss
 
 
-# --- [3] VGG Perceptual Loss ---
+# ============================================================
+# [3] VGG Perceptual Loss
+# ============================================================
 class VGGLoss(nn.Module):
     """
-    VGG19의 앞부분 feature를 사용한 perceptual loss.
-    입력 이미지는 [-1,1] 범위를 가정하고, 내부에서 ImageNet 정규화까지 수행한다.
+    VGG19 앞부분 feature 기반 perceptual loss.
+    - 입력: [-1,1]
+    - 내부에서 [0,1] 변환 + ImageNet mean/std 정규화
+    - AMP에서도 float32로 강제하는 편이 안전
     """
 
     def __init__(self):
@@ -207,23 +229,12 @@ class VGGLoss(nn.Module):
         try:
             weights = models.VGG19_Weights.IMAGENET1K_V1
             vgg = models.vgg19(weights=weights).features
-            self.register_buffer(
-                "mean", torch.tensor(weights.meta["mean"]).view(1, 3, 1, 1)
-            )
-            self.register_buffer(
-                "std", torch.tensor(weights.meta["std"]).view(1, 3, 1, 1)
-            )
+            self.register_buffer("mean", torch.tensor(weights.meta["mean"]).view(1, 3, 1, 1))
+            self.register_buffer("std", torch.tensor(weights.meta["std"]).view(1, 3, 1, 1))
         except Exception:
-            # 구버전 torchvision 호환
             vgg = models.vgg19(pretrained=True).features
-            self.register_buffer(
-                "mean",
-                torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
-            )
-            self.register_buffer(
-                "std",
-                torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
-            )
+            self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+            self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
         self.slice1 = nn.Sequential()
         self.slice2 = nn.Sequential()
@@ -232,16 +243,11 @@ class VGGLoss(nn.Module):
         for x in range(4, 9):
             self.slice2.add_module(str(x), vgg[x])
 
-        # VGG는 고정
-        for param in self.parameters():
-            param.requires_grad = False
+        for p in self.parameters():
+            p.requires_grad = False
 
     def _preprocess(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        [-1,1] 범위의 이미지를 [0,1]로 변환 후 ImageNet mean/std 정규화.
-        """
         x = (x + 1.0) / 2.0
-        # AMP 상황에서도 VGG는 float32로 고정하는 편이 안전
         x = x.float()
         mean = self.mean.to(x.device, dtype=x.dtype)
         std = self.std.to(x.device, dtype=x.dtype)
@@ -256,5 +262,4 @@ class VGGLoss(nn.Module):
         h2_x = self.slice2(h1_x)
         h2_y = self.slice2(h1_y)
 
-        loss = F.l1_loss(h1_x, h1_y) + F.l1_loss(h2_x, h2_y)
-        return loss
+        return F.l1_loss(h1_x, h1_y) + F.l1_loss(h2_x, h2_y)
